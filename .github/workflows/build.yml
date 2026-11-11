@@ -1,0 +1,76 @@
+name: build
+
+# 用官方 SDK 镜像编出真实可安装的包，避免"Makefile 看着对但没人验证过"。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: ${{ matrix.ext }} / ${{ matrix.sdk }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 25.12.x 用 apk，24.10.x 仍用 opkg/ipk
+          - sdk: x86-64-25.12.6
+            ext: apk
+          - sdk: x86-64-24.10.8
+            ext: ipk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build in OpenWrt SDK
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD":/src \
+            -e V6W_EXT="${{ matrix.ext }}" \
+            openwrt/sdk:${{ matrix.sdk }} \
+            bash -c '
+              set -e
+              mkdir -p /home/build/openwrt/package/v6watch
+              cp -r /src/Makefile /src/root /home/build/openwrt/package/v6watch/
+              cd /home/build/openwrt
+              make defconfig
+              make package/v6watch/compile V=s -j"$(nproc)"
+              mkdir -p /src/dist
+              find bin -type f -name "v6watch*" -exec cp -v {} /src/dist/ \;
+            '
+          ls -l dist
+
+      - name: verify the package is not empty
+        run: |
+          set -e
+          ls dist/v6watch* >/dev/null
+          echo "built:"; ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v6watch-${{ matrix.ext }}-${{ matrix.sdk }}
+          path: dist/v6watch*
+          if-no-files-found: error
+
+  # 打 tag 时把产物挂到 release 上，别人下载后可直接装：
+  #   apk add --allow-untrusted ./v6watch-*.apk
+  #   opkg install ./v6watch_*.ipk
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: flatten
+        run: |
+          mkdir -p out
+          find artifacts -type f \( -name '*.apk' -o -name '*.ipk' \) -exec cp {} out/ \;
+          ls -lh out/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*

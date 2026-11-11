@@ -49,7 +49,9 @@ odhcp6c: Server returned IA_PD status 'No Binding'
 
 ## 安装
 
-### 一键（不需要 SDK）
+按你的网络情况挑一种。四种方式的最终效果完全一样。
+
+### 1. 在线一条命令
 
 ```sh
 wget -O- https://raw.githubusercontent.com/Jonnyan404/openwrt-v6watch/main/install.sh | sh
@@ -57,13 +59,36 @@ wget -O- https://raw.githubusercontent.com/Jonnyan404/openwrt-v6watch/main/insta
 
 装完会自动跑一次诊断，并启用 procd 服务（开机自启，在 LuCI「系统 → 启动项」里能看到）。
 
-卸载：
+### 2. 离线安装（访问不了 GitHub 时用这个）
+
+把仓库下载/拷贝到路由器上，解压后直接执行：
 
 ```sh
-wget -O- https://raw.githubusercontent.com/Jonnyan404/openwrt-v6watch/main/install.sh | sh -s -- --uninstall
+cd openwrt-v6watch-main
+sh install.sh
 ```
 
-### 用 SDK 编译成包
+脚本发现旁边有 `root/` 目录时会**直接本地安装，全程不联网**。所以只要能通过网盘、邮件、U 盘或论坛附件把仓库搞到路由器上，就能装——不需要它能访问 GitHub。
+
+代价只是拿不到自动更新，需要更新时重新拷一份。
+
+### 3. 预编译包
+
+从 [Releases](https://github.com/Jonnyan404/openwrt-v6watch/releases) 下载对应格式：
+
+```sh
+# 25.12 及更新（apk）
+apk add --allow-untrusted ./v6watch-1.0.0-r1.apk
+
+# 24.10 及更早（opkg）
+opkg install ./v6watch_1.0.0-r1_all.ipk
+```
+
+好处是被包管理器管着（`apk del v6watch` / `opkg remove v6watch` 能干净卸载），也方便塞进自己的固件。
+
+> 包同样要从 Releases 下载，所以它解决的是「装得规范」，不是「连不上」。真连不上用第 2 种。
+
+### 4. 自己用 SDK 编译
 
 ```sh
 echo "src-git v6watch https://github.com/Jonnyan404/openwrt-v6watch.git" >> feeds.conf.default
@@ -72,7 +97,14 @@ make menuconfig          # Network -> v6watch
 make package/v6watch/compile V=s
 ```
 
-产物格式（`.apk` / `.ipk`）由 SDK 自身版本决定，同一份 Makefile 通用。
+同一份 Makefile 通用于两代格式，产物是 `.apk` 还是 `.ipk` 由 SDK 自己的版本决定。
+
+### 卸载
+
+```sh
+sh install.sh --uninstall          # 脚本装的
+apk del v6watch                    # 或 opkg remove v6watch
+```
 
 ## 使用
 
