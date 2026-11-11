@@ -1,0 +1,50 @@
+# v6watch 配置
+#
+# uci set v6watch.settings.interval=120
+# uci commit v6watch && /etc/init.d/v6watch restart
+
+config settings 'settings'
+	# 总开关
+	option enabled '1'
+
+	# 要监控的接口。auto = 自动挑一个带 IPv6 委派(PD/地址)的已启用接口，
+	# 所以不管你的接口叫 wan6、wwan6 还是别的，都不用改。
+	option interface 'auto'
+
+	# 检测周期（秒）
+	option interval '120'
+
+	# 连续失败多少次才动手（防止单次抖动误判）
+	option failure_threshold '2'
+
+	# 两次修复之间的最小间隔（秒），防止重启风暴
+	option cooldown '600'
+
+	# 连续修复失败后的退避时间（秒）
+	option backoff '1800'
+
+	# 是否允许自动修复。0 = 只诊断告警
+	option auto_repair '1'
+
+	# 是否对 egress_down（出口整体不通）也尝试修复。
+	# 默认 0：这种通常是上游/运营商的问题，重启接口没用，
+	# 反复重启还会让 LAN 客户端的 PD 前缀抖动。真需要再打开。
+	option repair_egress '0'
+
+	# 修复方式：auto = 先 ifup，失败再 down/up；也可设 ifup / ubus
+	option repair_mode 'auto'
+
+	# 日志级别 0=只记错误 1=错误+状态变化 2=详细
+	option log_level '2'
+
+	# 日志文件保留行数（/tmp，重启即清空，不写 flash）
+	option max_log_entries '500'
+
+# 探测目标：任意 IPv6 地址，建议填国内可达的
+config probe 'ali_dns'
+	option host '2400:3200::1'
+	option enabled '1'
+
+config probe 'ali_dns2'
+	option host '2400:3200:baba::1'
+	option enabled '1'

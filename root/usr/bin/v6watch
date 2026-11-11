@@ -1,0 +1,494 @@
+#!/bin/sh
+#
+# v6watch - IPv6 出口自愈与诊断
+#
+# 与"ping 不通就重启接口"的看门狗不同，v6watch 先把故障分层定位，
+# 只在确实该动手的情况下才动手：
+#
+#   healthy         一切正常
+#   link_down       上游网关 ND 不可达      -> 不动，等链路恢复
+#   egress_down     上游可达，出口整体不通  -> 默认只告警（重启无用）
+#   delegation_lost 直连前缀通、委派地址不通 -> 重启接口，重建 DHCPv6 绑定
+#
+# delegation_lost 是这类问题的典型形态：上游把"这个客户端的前缀归谁"的
+# 转发表项丢了，而本机地址、前缀、路由、lifetime 全部正常且在续期，
+# 于是路由器看着一切正常、实际一个包都出不去。
+# 伴随日志常见：odhcp6c "Server returned IA_NA status 'No Binding'"。
+#
+# 用法:
+#   v6watch --daemon   守护模式（由 /etc/init.d/v6watch 托管）
+#   v6watch --once     只检测一次，按需修复
+#   v6watch --diag     只诊断，不修复，输出报告
+#   v6watch --status   输出一行状态，适合给别的脚本消费
+#
+# License: MIT
+
+. /lib/functions.sh
+
+STATE_DIR=/tmp/v6watch
+LOG_FILE=$STATE_DIR/v6watch.log
+FAIL_FILE=$STATE_DIR/failcount
+LAST_REPAIR_FILE=$STATE_DIR/last_repair
+NEXT_RETRY_FILE=$STATE_DIR/next_retry
+UNRESOLVED_FILE=$STATE_DIR/unresolved
+
+# ---------- 默认值 ----------
+ENABLED=1
+IFACE=auto
+INTERVAL=120
+FAIL_THRESHOLD=2
+COOLDOWN=600
+BACKOFF=1800
+AUTO_REPAIR=1
+REPAIR_EGRESS=0
+REPAIR_MODE=auto
+LOG_LEVEL=2
+MAX_LOG=500
+BOOT_GRACE=90
+PROBES=""
+
+LOG_LEVEL_ERROR=0
+LOG_LEVEL_INFO=1
+LOG_LEVEL_DEBUG=2
+
+# ---------- 日志 ----------
+logmsg() {
+	local level=$1
+	shift
+	[ "$level" -gt "$LOG_LEVEL" ] && return 0
+	mkdir -p "$STATE_DIR"
+	logger -t v6watch "$*" 2>/dev/null
+	echo "$(date '+%F %T') [$level] $*" >>"$LOG_FILE"
+	local n
+	n=$(wc -l <"$LOG_FILE" 2>/dev/null || echo 0)
+	if [ "$n" -gt "$MAX_LOG" ]; then
+		tail -n $((MAX_LOG / 2)) "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null &&
+			mv "$LOG_FILE.tmp" "$LOG_FILE"
+	fi
+}
+err() { logmsg $LOG_LEVEL_ERROR "$@"; }
+info() { logmsg $LOG_LEVEL_INFO "$@"; }
+debug() { logmsg $LOG_LEVEL_DEBUG "$@"; }
+
+# ---------- 配置 ----------
+add_probe() {
+	local section=$1
+	local host enabled
+	config_get host "$section" host ""
+	config_get_bool enabled "$section" enabled 1
+	[ "$enabled" = "1" ] || return 0
+	[ -n "$host" ] || return 0
+	PROBES="$PROBES $host"
+}
+
+load_config() {
+	config_load v6watch
+
+	config_get_bool ENABLED settings enabled 1
+	config_get IFACE settings interface auto
+	config_get INTERVAL settings interval 120
+	config_get FAIL_THRESHOLD settings failure_threshold 2
+	config_get COOLDOWN settings cooldown 600
+	config_get BACKOFF settings backoff 1800
+	config_get_bool AUTO_REPAIR settings auto_repair 1
+	config_get_bool REPAIR_EGRESS settings repair_egress 0
+	config_get REPAIR_MODE settings repair_mode auto
+	config_get LOG_LEVEL settings log_level 2
+	config_get MAX_LOG settings max_log_entries 500
+
+	PROBES=""
+	config_foreach add_probe probe
+	[ -n "$PROBES" ] || PROBES="2400:3200::1 2400:3200:baba::1"
+
+	case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=120 ;; esac
+	[ "$INTERVAL" -lt 30 ] && INTERVAL=30
+	case "$FAIL_THRESHOLD" in ''|*[!0-9]*) FAIL_THRESHOLD=2 ;; esac
+	[ "$FAIL_THRESHOLD" -lt 1 ] && FAIL_THRESHOLD=1
+	case "$COOLDOWN" in ''|*[!0-9]*) COOLDOWN=600 ;; esac
+	[ "$COOLDOWN" -lt 60 ] && COOLDOWN=60
+	case "$BACKOFF" in ''|*[!0-9]*) BACKOFF=1800 ;; esac
+	case "$LOG_LEVEL" in ''|*[!0-9]*) LOG_LEVEL=2 ;; esac
+	[ "$LOG_LEVEL" -gt 2 ] && LOG_LEVEL=2
+	case "$MAX_LOG" in ''|*[!0-9]*) MAX_LOG=500 ;; esac
+	[ "$MAX_LOG" -lt 50 ] && MAX_LOG=50
+}
+
+# ---------- 接口探测 ----------
+# 自动挑一个"带 IPv6 委派"的接口，省得用户去猜自己叫 wan6 还是 wwan6
+detect_iface() {
+	local i st pfx addr
+	for i in $(ubus list 'network.interface.*' 2>/dev/null | sed 's/^network\.interface\.//'); do
+		st=$(ubus call network.interface."$i" status 2>/dev/null)
+		[ -n "$st" ] || continue
+		echo "$st" | grep -q '"up": true' || continue
+		pfx=$(echo "$st" | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null)
+		addr=$(echo "$st" | jsonfilter -e '@["ipv6-address"][0].address' 2>/dev/null)
+		if [ -n "$pfx" ] || [ -n "$addr" ]; then
+			echo "$i"
+			return 0
+		fi
+	done
+	return 1
+}
+
+resolve_iface() {
+	if [ "$IFACE" = "auto" ]; then
+		IFACE=$(detect_iface) || IFACE=""
+	fi
+	[ -n "$IFACE" ]
+}
+
+iface_dev() {
+	ubus call network.interface."$IFACE" status 2>/dev/null |
+		jsonfilter -e '@.l3_device' 2>/dev/null
+}
+
+iface_up() {
+	ubus call network.interface."$IFACE" status 2>/dev/null |
+		grep -q '"up": true'
+}
+
+# ---------- 探针 ----------
+# 上游链路上的链路本地网关（用任一默认路由的 next-hop）
+route_gw() {
+	local dev=$1
+	ip -6 route show default dev "$dev" 2>/dev/null |
+		awk '{for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit }}'
+}
+
+has_v6_route() {
+	local dev=$1
+	ip -6 route show default dev "$dev" 2>/dev/null | grep -q .
+}
+
+# 从直连 /64 前缀里取一个 SLAAC 地址：这是判断"上游到底认哪一类源地址"的钥匙
+slaac_src() {
+	local dev=$1
+	ip -6 -o addr show dev "$dev" scope global 2>/dev/null |
+		awk '$3 == "inet6" && $4 ~ /\/64$/ { sub(/\/64$/, "", $4); print $4; exit }'
+}
+
+ping6_ok() { ping6 -c 2 -W 2 "$@" >/dev/null 2>&1; }
+
+# 所有探测目标，用默认源（内核自选）——这才是真正代表"路由器出去的包"
+egress_ok() {
+	local h
+	for h in $PROBES; do
+		ping6_ok "$h" && return 0
+	done
+	return 1
+}
+
+# 用指定源地址探测
+egress_src_ok() {
+	local src=$1 h
+	for h in $PROBES; do
+		ping6_ok -I "$src" "$h" && return 0
+	done
+	return 1
+}
+
+# ---------- 诊断 ----------
+# 结果写入以下变量：
+#   D_IFACE D_DEV D_UP D_ROUTE D_GW D_GW_OK D_EGRESS D_SLAAC D_SLAAC_OK D_VERDICT
+# 传 deep 时，健康状态下也会测试直连前缀源的连通性（供 --diag 输出完整画像）
+diagnose() {
+	local deep=$1
+	D_IFACE=""
+	D_DEV=""
+	D_UP=0
+	D_ROUTE=0
+	D_GW=""
+	D_GW_OK=0
+	D_EGRESS=0
+	D_SLAAC=""
+	D_SLAAC_OK=""
+	D_VERDICT="unknown"
+
+	if ! resolve_iface; then
+		D_VERDICT="no_iface"
+		return 0
+	fi
+	D_IFACE=$IFACE
+	D_DEV=$(iface_dev)
+	[ -n "$D_DEV" ] || { D_VERDICT="no_iface"; return 0; }
+	iface_up && D_UP=1
+	[ "$D_UP" = "1" ] || { D_VERDICT="iface_down"; return 0; }
+
+	has_v6_route "$D_DEV" && D_ROUTE=1
+	if [ "$D_ROUTE" = "0" ]; then
+		D_VERDICT="no_v6_route"
+		return 0
+	fi
+
+	D_GW=$(route_gw "$D_DEV")
+	if [ -n "$D_GW" ] && ping6_ok -I "$D_DEV" "$D_GW"; then
+		D_GW_OK=1
+	fi
+
+	# 先采集直连前缀地址：它是区分"上游认不认委派地址"的钥匙
+	D_SLAAC=$(slaac_src "$D_DEV")
+	[ -n "$D_SLAAC" ] || D_SLAAC_OK=2
+
+	egress_ok && D_EGRESS=1
+
+	if [ "$D_EGRESS" = "1" ]; then
+		D_VERDICT="healthy"
+		# --diag 时把直连前缀源也测一遍，给完整画像
+		if [ "$deep" = "deep" ] && [ -n "$D_SLAAC" ]; then
+			if egress_src_ok "$D_SLAAC"; then
+				D_SLAAC_OK=1
+			else
+				D_SLAAC_OK=0
+			fi
+		fi
+		return 0
+	fi
+
+	if [ "$D_GW_OK" = "0" ]; then
+		D_VERDICT="link_down"
+		return 0
+	fi
+
+	# 网关可达但出口不通，看直连前缀的源地址能不能出去。
+	# 能出去 -> 上游只认直连 /64，不认委派给我们的地址（PD / IA_NA）
+	if [ -z "$D_SLAAC" ]; then
+		# 没有直连前缀地址可对照，无法区分"委派失效"还是"上游整体故障"。
+		# 网关可达说明本机这一段是好的，允许修复一次（仍受冷却/退避约束）。
+		D_VERDICT="unknown_egress"
+		return 0
+	fi
+	if egress_src_ok "$D_SLAAC"; then
+		D_SLAAC_OK=1
+		D_VERDICT="delegation_lost"
+	else
+		D_SLAAC_OK=0
+		D_VERDICT="egress_down"
+	fi
+	return 0
+}
+
+verdict_text() {
+	case "$1" in
+	healthy) echo "正常" ;;
+	link_down) echo "上游链路不可达（无线掉线 / 上游设备故障）" ;;
+	egress_down) echo "上游可达但 IPv6 出口整体不通（运营商侧或上游转发故障）" ;;
+	unknown_egress) echo "网关可达、出口不通，但没有直连前缀地址可用于区分故障形态" ;;
+	delegation_lost) echo "上游不认本机的委派地址（PD / IA_NA），直连前缀正常" ;;
+	no_v6_route) echo "接口上没有 IPv6 默认路由（未获取到 RA / DHCPv6）" ;;
+	iface_down) echo "承载接口未就绪" ;;
+	no_iface) echo "找不到带 IPv6 的接口" ;;
+	*) echo "未知" ;;
+	esac
+}
+
+verdict_advice() {
+	case "$1" in
+	healthy) echo "无需处理" ;;
+	link_down) echo "等待链路恢复；此时重启 IPv6 接口无意义" ;;
+	egress_down) echo "重启接口通常无效；建议检查上游设备 / 运营商" ;;
+	unknown_egress) echo "网关可达，先尝试重启接口；多次无效再查上游" ;;
+	delegation_lost) echo "重启接口可强制重新 DHCPv6 交涉，通常立即恢复" ;;
+	no_v6_route) echo "检查上游是否下发 RA / DHCPv6-PD" ;;
+	*) echo "检查接口配置" ;;
+	esac
+}
+
+# ---------- 报告 ----------
+print_diag() {
+	local egr
+	echo ""
+	echo "v6watch 诊断报告  $(date '+%F %T')"
+	echo "----------------------------------------------------"
+	printf '%-16s: %s\n' "interface" "${D_IFACE:-?} (${D_DEV:-?})"
+	printf '%-16s: %s\n' "status" "$([ "$D_UP" = 1 ] && echo up || echo down)"
+
+	if [ "$D_ROUTE" = 1 ]; then
+		printf '%-16s: %s\n' "v6 default route" "via ${D_GW:-?}"
+		printf '%-16s: %s\n' "upstream gateway" "$([ "$D_GW_OK" = 1 ] && echo reachable || echo unreachable)"
+	else
+		printf '%-16s: %s\n' "v6 default route" "none"
+	fi
+
+	printf '%-16s: %s\n' "egress (default)" "$([ "$D_EGRESS" = 1 ] && echo ok || echo FAIL)"
+	if [ -n "$D_SLAAC" ]; then
+		case "$D_SLAAC_OK" in
+		1) egr="ok" ;;
+		0) egr="FAIL" ;;
+		*) egr="not tested" ;;
+		esac
+		printf '%-16s: %s  %s\n' "egress (slaac)" "$egr" "$D_SLAAC"
+	else
+		printf '%-16s: %s\n' "egress (slaac)" "无 /64 地址可测"
+	fi
+
+	echo "----------------------------------------------------"
+	printf '%-16s: %s\n' "verdict" "$D_VERDICT"
+	printf '%-16s: %s\n' "meaning" "$(verdict_text "$D_VERDICT")"
+	printf '%-16s: %s\n' "advice" "$(verdict_advice "$D_VERDICT")"
+	echo ""
+
+	# 只在这个特定形态下多解释一句，帮人看懂"为什么地址全在还不通"
+	if [ "$D_VERDICT" = "delegation_lost" ]; then
+		echo "本机的地址、前缀、路由、lifetime 全部正常，包也发出去了，"
+		echo "但上游只放行直连 /64 的源地址，不认委派给你的 PD / IA_NA 地址。"
+		echo "这通常意味着上游的 DHCPv6 绑定表被重置过（上游重启 / 清表），"
+		echo "而本机仍在用旧租约续期，双方状态脱节。"
+		echo ""
+	fi
+}
+
+print_status() {
+	# 给脚本消费的一行摘要
+	echo "verdict=$D_VERDICT iface=${D_IFACE:-none} dev=${D_DEV:-none} gw_ok=$D_GW_OK egress=$D_EGRESS slaac_ok=${D_SLAAC_OK:-na}"
+}
+
+# ---------- 统计 ----------
+getn() {
+	local f=$1 def=${2:-0} v
+	v=$(cat "$f" 2>/dev/null)
+	case "$v" in ''|*[!0-9]*) v=$def ;; esac
+	echo "$v"
+}
+
+# ---------- 修复 ----------
+do_repair() {
+	local now v
+	logmsg $LOG_LEVEL_INFO "REPAIR: 重启 $D_IFACE（判定 $D_VERDICT）"
+	date +%s >"$LAST_REPAIR_FILE"
+	date '+%F %T' >"$STATE_DIR/last_repair_human"
+
+	ifup "$D_IFACE" >/dev/null 2>&1
+	sleep 12
+
+	# 复查，这是与"重启完就不管"的关键区别
+	diagnose
+	if [ "$D_VERDICT" = "healthy" ]; then
+		info "RESOLVED: ifup 后已恢复"
+		echo 0 >"$FAIL_FILE"
+		echo 0 >"$UNRESOLVED_FILE"
+		return 0
+	fi
+
+	debug "ifup 未恢复，升级为 down/up"
+	ubus call network.interface."$D_IFACE" down >/dev/null 2>&1
+	sleep 3
+	ubus call network.interface."$D_IFACE" up >/dev/null 2>&1
+	sleep 15
+
+	diagnose
+	if [ "$D_VERDICT" = "healthy" ]; then
+		info "RESOLVED: down/up 后已恢复"
+		echo 0 >"$FAIL_FILE"
+		echo 0 >"$UNRESOLVED_FILE"
+		return 0
+	fi
+
+	# 修不好就退避，而不是每轮都再来一次
+	v=$(($(getn "$UNRESOLVED_FILE") + 1))
+	echo "$v" >"$UNRESOLVED_FILE"
+	echo 0 >"$FAIL_FILE"
+
+	if [ "$v" -ge 3 ]; then
+		now=$(date +%s)
+		echo "$((now + BACKOFF))" >"$NEXT_RETRY_FILE"
+		err "GIVEUP: 连续 $v 次修复无效，$BACKOFF 秒内不再尝试（判定 $D_VERDICT）"
+	else
+		err "FAIL: 修复后仍未恢复（连续 $v 次，判定 $D_VERDICT）"
+	fi
+	return 1
+}
+
+# ---------- 一轮 ----------
+run_cycle() {
+	local c now next
+
+	diagnose
+
+	if [ "$D_VERDICT" = "healthy" ]; then
+		[ "$(getn "$FAIL_FILE")" != "0" ] && info "OK: 已恢复，失败计数清零"
+		echo 0 >"$FAIL_FILE"
+		echo 0 >"$UNRESOLVED_FILE"
+		return 0
+	fi
+
+	debug "判定 $D_VERDICT（gw_ok=$D_GW_OK egress=$D_EGRESS slaac_ok=${D_SLAAC_OK:-na}）"
+
+	# 这些情况重启接口没有意义，只报告
+	case "$D_VERDICT" in
+	link_down | iface_down | no_v6_route | no_iface)
+		echo 0 >"$FAIL_FILE"
+		info "SKIP: $D_VERDICT —— $(verdict_advice "$D_VERDICT")"
+		return 0
+		;;
+	esac
+
+	if [ "$D_VERDICT" = "egress_down" ] && [ "$REPAIR_EGRESS" != "1" ]; then
+		echo 0 >"$FAIL_FILE"
+		info "SKIP: egress_down —— $(verdict_advice "$D_VERDICT")；如需强制重试打开 repair_egress"
+		return 0
+	fi
+
+	c=$(($(getn "$FAIL_FILE") + 1))
+	echo "$c" >"$FAIL_FILE"
+	info "WARN: $D_VERDICT（连续 $c/$FAIL_THRESHOLD）"
+
+	[ "$c" -ge "$FAIL_THRESHOLD" ] || return 0
+	[ "$AUTO_REPAIR" = "1" ] || { info "未开启自动修复"; return 0; }
+
+	now=$(date +%s)
+	if [ "$now" -lt "$(getn "$LAST_REPAIR_FILE")" ] ||
+		[ $((now - $(getn "$LAST_REPAIR_FILE"))) -lt "$COOLDOWN" ]; then
+		debug "冷却中，暂不修复"
+		return 0
+	fi
+	next=$(getn "$NEXT_RETRY_FILE")
+	if [ "$next" -gt 0 ] && [ "$now" -lt "$next" ]; then
+		debug "退避中（剩 $((next - now))s）"
+		return 0
+	fi
+
+	do_repair
+	return 0
+}
+
+# ---------- 入口 ----------
+main() {
+	local mode=$1
+
+	mkdir -p "$STATE_DIR"
+	load_config
+
+	case "$mode" in
+	--diag)
+		diagnose deep
+		print_diag
+		;;
+	--status)
+		diagnose
+		print_status
+		;;
+	--once)
+		run_cycle
+		;;
+	--daemon)
+		info "START: 监控模式启动（判定周期 ${INTERVAL}s）"
+		sleep "$BOOT_GRACE"
+		while :; do
+			load_config
+			if [ "$ENABLED" = "1" ]; then
+				run_cycle
+			else
+				debug "已禁用，跳过"
+			fi
+			sleep "$INTERVAL"
+		done
+		;;
+	*)
+		echo "用法: $0 {--daemon|--once|--diag|--status}"
+		exit 1
+		;;
+	esac
+}
+
+main "$@"

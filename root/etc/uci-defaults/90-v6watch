@@ -1,0 +1,13 @@
+#!/bin/sh
+# 首次安装时启用并启动服务；升级时不覆盖用户已有设置。
+
+[ -f /etc/config/v6watch ] || exit 0
+
+if [ "$(uci -q get v6watch.settings.installed)" != "1" ]; then
+	uci -q set v6watch.settings.installed='1'
+	uci -q commit v6watch
+	/etc/init.d/v6watch enable
+	/etc/init.d/v6watch restart >/dev/null 2>&1
+fi
+
+exit 0
