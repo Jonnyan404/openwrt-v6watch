@@ -26,12 +26,16 @@ PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
 
+# PKGARCH:=all 在 25.x 必须写进 Package 块内部：Package/Default 会用
+# PKGARCH:=$(ARCH_PACKAGES) 覆盖掉顶部的设置，否则 apk 里会记成 arch:x86_64，
+# 装到 aarch64 路由器上报架构不匹配。写成 all 后 apk 记为 noarch。
 define Package/v6watch
   SECTION:=net
   CATEGORY:=Network
   TITLE:=IPv6 egress watchdog with layered diagnosis
   URL:=https://github.com/Jonnyan404/openwrt-v6watch
   DEPENDS:=+ubus +jsonfilter
+  PKGARCH:=all
 endef
 
 define Package/v6watch/description
