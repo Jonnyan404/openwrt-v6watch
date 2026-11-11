@@ -43,15 +43,31 @@ if [ -n "$SRC_DIR" ] && [ -d "$SRC_DIR/root" ]; then
 else
 	TMP=$(mktemp -d)
 	trap 'rm -rf "$TMP"' EXIT
-	URL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
-	say "下载 $URL"
-	if command -v wget >/dev/null 2>&1; then
-		wget -qO- "$URL" | tar xz -C "$TMP"
-	elif command -v curl >/dev/null 2>&1; then
-		curl -fsSL "$URL" | tar xz -C "$TMP"
-	else
-		die "需要 wget 或 curl"
-	fi
+
+	# 用 codeload 直连：github.com 的 archive 链接会 302 跳转，
+	# 部分网络环境下重定向会被拦，拿到的就不是 tar.gz 了。
+	PKG=$TMP/archive.tar.gz
+	ok=0
+	for URL in \
+		"https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" \
+		"https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"; do
+		say "下载 $URL"
+		if command -v wget >/dev/null 2>&1; then
+			wget -q -O "$PKG" --timeout=30 "$URL" || continue
+		elif command -v curl >/dev/null 2>&1; then
+			curl -fsSL --max-time 30 -o "$PKG" "$URL" || continue
+		else
+			die "需要 wget 或 curl"
+		fi
+		if tar tzf "$PKG" >/dev/null 2>&1; then
+			ok=1
+			break
+		fi
+		say "  这个地址拿到的不是有效的压缩包，换下一个"
+	done
+	[ "$ok" = "1" ] || die "下载失败。可直接下载仓库后本地安装： SRC_DIR=/path/to/openwrt-v6watch sh install.sh"
+
+	tar xzf "$PKG" -C "$TMP" || die "解压失败"
 	ROOT=$(find "$TMP" -maxdepth 2 -type d -name root | head -n 1)
 	[ -n "$ROOT" ] || die "下载包结构异常，找不到 root 目录"
 fi
