@@ -84,9 +84,12 @@ apk add --allow-untrusted ./v6watch-1.0.0-r1.apk
 opkg install ./v6watch_1.0.0-r1_all.ipk
 ```
 
-好处是被包管理器管着（`apk del v6watch` / `opkg remove v6watch` 能干净卸载），也方便塞进自己的固件。
+包是 `noarch` 的，任何架构都能装。好处是被包管理器管着——`apk del v6watch` 会把程序文件删干净，而 `/etc/config/v6watch` 作为配置文件保留。
 
-> 包同样要从 Releases 下载，所以它解决的是「装得规范」，不是「连不上」。真连不上用第 2 种。
+两个实测出来的注意点：
+
+- **包同样要从 Releases 下载**，所以它解决的是「装得规范」，不是「连不上」。而且 `releases/download/` 会 302 到 `objects.githubusercontent.com`，某些网络下这条链接比 `raw` / `codeload` 更容易被拦。
+- **安装脚本和包不要混着用**。脚本是直接 `cp` 文件，包管理器不知道这些文件的归属；反过来卸载包也清不掉脚本装的。选定一种，要换就先把另一种清理干净。
 
 ### 4. 自己用 SDK 编译
 

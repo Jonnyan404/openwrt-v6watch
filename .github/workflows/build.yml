@@ -27,21 +27,21 @@ jobs:
 
       - name: build in OpenWrt SDK
         run: |
-          mkdir -p dist
-          docker run --rm -v "$PWD":/src \
-            -e V6W_EXT="${{ matrix.ext }}" \
+          # SDK 镜像的工作目录是 /builder（用户 buildbot, uid 1000），
+          # 不是 /home/build；以 root 跑是为了能同时写 /builder 和挂载点。
+          mkdir -p dist && chmod 777 dist
+          docker run --rm --user root -v "$PWD":/src \
             openwrt/sdk:${{ matrix.sdk }} \
             bash -c '
               set -e
-              mkdir -p /home/build/openwrt/package/v6watch
-              cp -r /src/Makefile /src/root /home/build/openwrt/package/v6watch/
-              cd /home/build/openwrt
-              make defconfig
+              cd /builder
+              mkdir -p package/v6watch
+              cp -r /src/Makefile /src/root package/v6watch/
+              make defconfig >/dev/null
               make package/v6watch/compile V=s -j"$(nproc)"
-              mkdir -p /src/dist
               find bin -type f -name "v6watch*" -exec cp -v {} /src/dist/ \;
             '
-          ls -l dist
+          ls -lh dist
 
       - name: verify the package is not empty
         run: |
