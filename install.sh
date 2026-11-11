@@ -2,15 +2,22 @@
 #
 # v6watch 一键安装（不依赖 OpenWrt SDK）
 #
-#   wget -O- https://raw.githubusercontent.com/Jonnyan404/openwrt-v6watch/main/install.sh | sh
-#   或下载后： sh install.sh
-#   本地源码目录： SRC_DIR=/path/to/openwrt-v6watch sh install.sh
-#   卸载： sh install.sh --uninstall
+#   在线：wget -O- https://raw.githubusercontent.com/Jonnyan404/openwrt-v6watch/main/install.sh | sh
+#   离线：把整个仓库拷到路由器上，解压后 sh install.sh   （不联网，推荐给访问不了 GitHub 的环境）
+#   指定源码目录：SRC_DIR=/path/to/openwrt-v6watch sh install.sh
+#   卸载：sh install.sh --uninstall
 #
 set -e
 
 REPO=${REPO:-Jonnyan404/openwrt-v6watch}
 BRANCH=${BRANCH:-main}
+
+# 脚本旁边就有 root/ 的话（解压了仓库 zip、或 scp 了整个目录），
+# 直接用它安装，全程不联网。这条路径比在线安装更可靠。
+SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")
+if [ -z "$SRC_DIR" ] && [ -n "$SELF_DIR" ] && [ -d "$SELF_DIR/root" ]; then
+	SRC_DIR=$SELF_DIR
+fi
 
 say() { printf '%s\n' "$*"; }
 die() {
