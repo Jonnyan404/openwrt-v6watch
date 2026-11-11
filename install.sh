@@ -73,15 +73,20 @@ else
 fi
 
 # ---- 安装文件 ----
-install -m 0755 "$ROOT/usr/bin/v6watch" /usr/bin/v6watch
-install -m 0755 "$ROOT/etc/init.d/v6watch" /etc/init.d/v6watch
-install -d /etc/uci-defaults
-install -m 0755 "$ROOT/etc/uci-defaults/90-v6watch" /etc/uci-defaults/90-v6watch
+# 不用 install：OpenWrt 的 busybox 里没有这个命令
+put() {
+	cp "$1" "$2" && chmod "$3" "$2" || die "写入 $2 失败"
+}
+
+put "$ROOT/usr/bin/v6watch" /usr/bin/v6watch 0755
+put "$ROOT/etc/init.d/v6watch" /etc/init.d/v6watch 0755
+mkdir -p /etc/uci-defaults
+put "$ROOT/etc/uci-defaults/90-v6watch" /etc/uci-defaults/90-v6watch 0755
 
 if [ -f /etc/config/v6watch ]; then
 	say "已存在 /etc/config/v6watch，保留现有配置"
 else
-	install -m 0644 "$ROOT/etc/config/v6watch" /etc/config/v6watch
+	put "$ROOT/etc/config/v6watch" /etc/config/v6watch 0644
 fi
 
 # ---- 启用并启动 ----
